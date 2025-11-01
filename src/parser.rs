@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::io::{Write};
 
 #[derive(Debug)]
 pub enum Bencode {
@@ -33,6 +34,60 @@ impl Bencode {
             b'd' => Bencode::parse_dict(bytes),
             b'0'..=b'9' => Bencode::parse_string(bytes),
             _ => Err(ParseError::UnknownType),
+        }
+    }
+    
+    pub fn as_dict(&self) -> Option<&BTreeMap<Vec<u8>, Bencode>> {
+        match self {
+            Bencode::Dictionary(d) => Some(d),
+            _ => None,
+        }
+    }
+    
+    pub fn as_string(&self) -> Option<&[u8]> {
+        match self {
+            Bencode::String(s) => Some(s),
+            _ => None,
+        }
+    }
+    
+    pub fn as_int(&self) -> Option<i64> {
+        match self {
+            Bencode::Integer(i) => Some(*i),
+            _ => None,
+        }
+    }
+    
+    pub fn encode<W: Write>(bencode: &Bencode, writer: &mut W) -> std::io::Result<()> {
+        match bencode {
+            Bencode::Integer(i) => {
+                writer.write_all(b"i")?;
+                write!(writer, "{}", i)?;
+                writer.write_all(b"e")?;
+                Ok(())
+            },
+            Bencode::String(s) => {
+                write!(writer, "{}:", s.len())?;
+                writer.write_all(s)?;
+                Ok(())
+            },
+            Bencode::List(l) => {
+                writer.write_all(b"l")?;
+                for item in l {
+                    Bencode::encode(item, writer)?;
+                }
+                writer.write_all(b"e")?;
+                Ok(())
+            },
+            Bencode::Dictionary(d) => {
+                writer.write_all(b"d")?;
+                for (key, value) in d {
+                    Bencode::encode(&Bencode::String(key.clone()), writer)?;
+                    Bencode::encode(value, writer)?;
+                }
+                writer.write_all(b"e")?;
+                Ok(())
+            }
         }
     }
 
