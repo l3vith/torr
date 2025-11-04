@@ -130,9 +130,51 @@ async fn tracker_request(
                 "Received response: action={}, transaction_id={}, connection_id={}",
                 res_action, res_transaction_id, res_connection_id
             );
+
+            // Implement retrying if failure in recieving the right action id
             if res_action != 0 {
                 return Err(TrackerError::InvalidAction(res_action));
             }
+
+            // Building Anncounce Request
+            const ANN_ACTION_ID: u32 = 1;
+            let ann_transaction_id: u32 = thread_rng().r#gen();
+            let event: u32 = 0;
+            let ip_addr: u32 = 0;
+            let key: u32 = thread_rng().r#gen();
+            let num_want: i32 = -1;
+            let port: u16 = 6881;
+
+            let mut announce_packet: Vec<u8> = Vec::new();
+            announce_packet.extend_from_slice(&res_connection_id.to_be_bytes());
+            announce_packet.extend_from_slice(&ANN_ACTION_ID.to_be_bytes());
+            announce_packet.extend_from_slice(&ann_transaction_id.to_be_bytes());
+            announce_packet.extend_from_slice(&info_hash);
+            announce_packet.extend_from_slice(&peer_id.as_bytes());
+            announce_packet.extend_from_slice(&downloaded.to_be_bytes());
+            announce_packet.extend_from_slice(&left.to_be_bytes());
+            announce_packet.extend_from_slice(&uploaded.to_be_bytes());
+            announce_packet.extend_from_slice(&event.to_be_bytes());
+            announce_packet.extend_from_slice(&ip_addr.to_be_bytes());
+            announce_packet.extend_from_slice(&key.to_be_bytes());
+            announce_packet.extend_from_slice(&num_want.to_be_bytes());
+            announce_packet.extend_from_slice(&port.to_be_bytes());
+
+            if announce_packet.len() != 98 {
+                return Err(TrackerError::InvalidResponseSize(announce_packet.len()));
+            }
+
+            println!("Sending announce request!");
+            socket
+                .send_to(&announce_packet, tracker_url)
+                .await
+                .map_err(|e| TrackerError::Io(e))?;
+            println!("Recieving announce response!");
+
+            let mut announce_buffer = vec![0u8; 4096];
+            let (ann_size, ann_addr) = socket.recv_from(&mut announce_buffer).await?;
+
+            println!("{:?}", &announce_buffer[..ann_size]);
 
             todo!()
         }
