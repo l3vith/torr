@@ -7,7 +7,7 @@ use rand::thread_rng;
 use rand::{Rng, distributions::Alphanumeric};
 use reqwest::Client;
 use sha1::{Digest, Sha1};
-use std::{fs, str};
+use std::{fs, net::Ipv4Addr, str};
 use thiserror::Error;
 use tokio;
 use tokio::net::UdpSocket;
@@ -19,6 +19,9 @@ pub enum TrackerError {
 
     #[error("invalid tracker action: {0}")]
     InvalidAction(u32),
+
+    #[error("invalid tracker protocol")]
+    InvalidProtocol,
 
     #[error("network error: {0}")]
     NetworkError(String),
@@ -45,38 +48,98 @@ pub enum TrackerError {
     Io(#[from] std::io::Error),
 }
 
-fn generate_peer_id() -> String {
-    let prefix = "-RS1000-"; // RS = Rust Client, 1000 = version 1.0.0
-    let random: String = rand::thread_rng()
-        .sample_iter(&Alphanumeric)
-        .take(12)
-        .map(char::from)
-        .collect();
-
-    format!("{}{}", prefix, random)
+#[derive(Debug)]
+pub struct Peer {
+    ip: Ipv4Addr,
+    port: u16,
 }
 
-async fn tracker_request(
-    url: &str,
-    info_hash: &[u8],
-    peer_id: &str,
-    port: u16,
-    uploaded: u64,
-    downloaded: u64,
-    left: u64,
-) -> Result<Bencode, TrackerError> {
-    let protocol = url
+pub struct Tracker {
+    pub url: String,
+    pub info_hash: [u8; 20],
+    pub peer_id: String,gi
+    pub port: u16,
+    pub uploaded: u64,
+    pub downloaded: u64,
+    pub left: u64,
+}
+
+#[derive(Debug)]
+pub struct TrackerResponse {
+    pub interval: u32,
+    pub leechers: u32,
+    pub seeders: u32,
+    pub peers: Vec<Peer>,
+}
+
+impl TrackerResponse {
+    pub fn new(interval: u32, leechers: u32, seeders: u32, peers: Vec<Peer>) -> TrackerResponse {
+        TrackerResponse {
+            interval,
+            leechers,
+            seeders,
+            peers,
+        }
+    }
+}
+
+impl Tracker {
+    pub fn new(
+        url: String,
+        info_hash: [u8; 20],
+        peer_id: String,
+        port: u16,
+        uploaded: u64,
+        downloaded: u64,
+        left: u64,
+    ) -> Tracker {
+        Tracker {
+            url,
+            info_hash,
+            peer_id,
+            port,
+            uploaded,
+            downloaded,
+            left,
+        }
+    }
+
+    pub fn generate_peer_id() -> String {
+        let prefix = "-RS1000-"; // RS = Rust Client, 1000 = version 1.0.0
+        let random: String = thread_rng()
+            .sample_iter(&Alphanumeric)
+            .take(12)
+            .map(char::from)
+            .collect();
+
+        format!("{}{}", prefix, random)
+    }
+}
+
+async fn tracker_request(tracker: &Tracker) -> Result<TrackerResponse, TrackerError> {
+    let protocol = tracker
+        .url
         .split("://")
         .next()
-        .ok_or_else(|| TrackerError::InvalidUrl(url.to_string()))?;
+        .ok_or_else(|| TrackerError::InvalidUrl(tracker.url.to_string()))?;
 
     match protocol {
         "http" | "https" => {
-            let info_hash_encoded = percent_encode(info_hash, NON_ALPHANUMERIC).to_string();
-            let peer_id_encoded = percent_encode(peer_id.as_bytes(), NON_ALPHANUMERIC).to_string();
+            let info_hash_encoded =
+                percent_encode(&tracker.info_hash, NON_ALPHANUMERIC).to_string();
+            let peer_id_encoded =
+                percent_encode(tracker.peer_id.as_bytes(), NON_ALPHANUMERIC).to_string();
+            let num_want = -1;
             let req = format!(
-                "{}?info_hash={}&peer_id={}&port={}&uploaded={}&downloaded={}&left={}&compact=1&event=started",
-                url, info_hash_encoded, peer_id_encoded, port, uploaded, downloaded, left
+                "{}?info_hash={}&peer_id={}&port={}&uploaded={}&downloaded={}&left={}&compact=1&event=started&numwant={}",
+                tracker.url,
+                info_hash_encoded,
+                peer_id_encoded,
+                tracker.port,
+                tracker.uploaded,
+                tracker.downloaded,
+                tracker.left,
+                num_want
             );
             let client = Client::new();
             let response = client
@@ -88,10 +151,49 @@ async fn tracker_request(
             let bytes = response.bytes().await.map_err(|_| TrackerError::Timeout)?;
             let (parsed_res, _) = Bencode::parse(bytes.to_vec().as_slice())
                 .map_err(|_| TrackerError::BencodeParseError)?;
-            Ok(parsed_res)
+            let res_dict = parsed_res.as_dict().ok_or(TrackerError::InvalidProtocol)?;
+
+            let interval: u32 = res_dict
+                .get(&b"interval".to_vec())
+                .ok_or(TrackerError::MissingField("Interval"))?
+                .as_int()
+                .ok_or(TrackerError::InvalidResponseFormat)?
+                .try_into()
+                .map_err(|_| TrackerError::InvalidResponseFormat)?;
+
+            let leechers: u32 = res_dict
+                .get(&b"leechers".to_vec())
+                .ok_or(TrackerError::MissingField("leechers"))?
+                .as_int()
+                .ok_or(TrackerError::InvalidResponseFormat)?
+                .try_into()
+                .map_err(|_| TrackerError::InvalidResponseFormat)?;
+
+            let seeders: u32 = res_dict
+                .get(&b"seeders".to_vec())
+                .ok_or(TrackerError::MissingField("seeders"))?
+                .as_int()
+                .ok_or(TrackerError::InvalidResponseFormat)?
+                .try_into()
+                .map_err(|_| TrackerError::InvalidResponseFormat)?;
+
+            let mut peers: Vec<Peer> = Vec::new();
+            let peer_string = res_dict
+                .get(&b"peers".to_vec())
+                .ok_or(TrackerError::MissingField("seeders"))?
+                .as_string()
+                .ok_or(TrackerError::InvalidResponseFormat)?;
+
+            for ip in peer_string.chunks_exact(6) {
+                let ip_addr: Ipv4Addr = Ipv4Addr::from(<[u8; 4]>::try_from(&ip[0..4]).unwrap());
+                let port: u16 = u16::from_be_bytes([ip[4], ip[5]]);
+                peers.push(Peer { ip: ip_addr, port })
+            }
+
+            Ok(TrackerResponse::new(interval, leechers, seeders, peers))
         }
         "udp" => {
-            let socket = UdpSocket::bind("0.0.0.0:9696")
+            let socket = UdpSocket::bind("0.0.0.0:0")
                 .await
                 .map_err(|e| TrackerError::Io(e))?;
 
@@ -104,9 +206,9 @@ async fn tracker_request(
             conn_req.extend_from_slice(&ACTION_FIELD.to_be_bytes());
             conn_req.extend_from_slice(&transaction_id.to_be_bytes());
 
-            let tracker_url = match url.strip_prefix("udp://") {
-                Some(url) => url,
-                None => return Err(TrackerError::InvalidUrl(url.to_string())),
+            let tracker_url = match tracker.url.strip_prefix("udp://") {
+                Some(u) => u,
+                None => return Err(TrackerError::InvalidUrl(tracker.url.to_string())),
             };
 
             socket
@@ -116,7 +218,7 @@ async fn tracker_request(
 
             let mut buffer = [0u8; 16];
 
-            let (size, addr) = socket.recv_from(&mut buffer).await.unwrap();
+            let (size, _addr) = socket.recv_from(&mut buffer).await.unwrap();
 
             if size != 16 {
                 return Err(TrackerError::InvalidResponseSize(size));
@@ -149,11 +251,11 @@ async fn tracker_request(
             announce_packet.extend_from_slice(&res_connection_id.to_be_bytes());
             announce_packet.extend_from_slice(&ANN_ACTION_ID.to_be_bytes());
             announce_packet.extend_from_slice(&ann_transaction_id.to_be_bytes());
-            announce_packet.extend_from_slice(&info_hash);
-            announce_packet.extend_from_slice(&peer_id.as_bytes());
-            announce_packet.extend_from_slice(&downloaded.to_be_bytes());
-            announce_packet.extend_from_slice(&left.to_be_bytes());
-            announce_packet.extend_from_slice(&uploaded.to_be_bytes());
+            announce_packet.extend_from_slice(&tracker.info_hash);
+            announce_packet.extend_from_slice(&tracker.peer_id.as_bytes());
+            announce_packet.extend_from_slice(&tracker.downloaded.to_be_bytes());
+            announce_packet.extend_from_slice(&tracker.left.to_be_bytes());
+            announce_packet.extend_from_slice(&tracker.uploaded.to_be_bytes());
             announce_packet.extend_from_slice(&event.to_be_bytes());
             announce_packet.extend_from_slice(&ip_addr.to_be_bytes());
             announce_packet.extend_from_slice(&key.to_be_bytes());
@@ -172,21 +274,37 @@ async fn tracker_request(
             println!("Recieving announce response!");
 
             let mut announce_buffer = vec![0u8; 4096];
-            let (ann_size, ann_addr) = socket.recv_from(&mut announce_buffer).await?;
+            let (ann_size, _ann_addr) = socket.recv_from(&mut announce_buffer).await?;
 
-            println!("{:?}", &announce_buffer[..ann_size]);
+            let action = u32::from_be_bytes(announce_buffer[0..4].try_into().unwrap());
+            let transaction_id = u32::from_be_bytes(announce_buffer[4..8].try_into().unwrap());
+            let interval = u32::from_be_bytes(announce_buffer[8..12].try_into().unwrap());
+            let leechers = u32::from_be_bytes(announce_buffer[12..16].try_into().unwrap());
+            let seeders = u32::from_be_bytes(announce_buffer[16..20].try_into().unwrap());
 
-            todo!()
+            let mut peer_list: Vec<Peer> = Vec::new();
+            for chunk in announce_buffer[20..ann_size].chunks_exact(6) {
+                let ip = Ipv4Addr::from(<[u8; 4]>::try_from(&chunk[0..4]).unwrap());
+                let port = u16::from_be_bytes([chunk[4], chunk[5]]);
+                peer_list.push(Peer { ip, port });
+            }
+
+            println!("Action: {}", action);
+            println!("Transaction ID: {}", transaction_id);
+            println!("Interval: {}", interval);
+            println!("Leechers: {}", leechers);
+            println!("Seeders: {}", seeders);
+            println!("Peer List: {}", peer_list.len());
+
+            Ok(TrackerResponse::new(interval, leechers, seeders, peer_list))
         }
-        _ => {
-            unimplemented!()
-        }
+        _ => Err(TrackerError::InvalidProtocol),
     }
 }
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    let bytes = fs::read("test/manjaro-gnome-25.0.10-251013-linux612.iso.torrent")?;
+    let bytes = fs::read("test/ubuntu-25.10-desktop-amd64.iso.torrent")?;
     let (parsed, _) = Bencode::parse(bytes.as_slice()).unwrap();
 
     let info = match parsed.as_dict().and_then(|d| d.get(&b"info".to_vec())) {
@@ -244,18 +362,17 @@ async fn main() -> std::io::Result<()> {
     let announce_string = str::from_utf8(announce_bytes)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "bencode parse error"))?;
 
-    let peer_id = generate_peer_id();
-    let response = match tracker_request(
-        announce_string,
-        &info_hash_bytes,
-        &peer_id,
+    let peer_id = Tracker::generate_peer_id();
+    let tracker = Tracker::new(
+        announce_string.to_string(),
+        info_hash_bytes.into(),
+        peer_id,
         6881,
         0,
         0,
         1000,
-    )
-    .await
-    {
+    );
+    let response = match tracker_request(&tracker).await {
         Ok(res) => res,
         Err(_) => {
             return Err(std::io::Error::new(
@@ -264,7 +381,7 @@ async fn main() -> std::io::Result<()> {
             ));
         }
     };
-    println!("Response: {}", response);
+    println!("Response: {:?}", response);
 
     Ok(())
 }
