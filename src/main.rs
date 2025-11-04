@@ -2,19 +2,23 @@ mod parser;
 use parser::Bencode;
 
 use hex;
-use percent_encoding::percent_encode;
-use percent_encoding::{NON_ALPHANUMERIC, PercentEncode};
+use percent_encoding::{NON_ALPHANUMERIC, percent_encode};
+use rand::thread_rng;
 use rand::{Rng, distributions::Alphanumeric};
 use reqwest::Client;
 use sha1::{Digest, Sha1};
 use std::{fs, str};
 use thiserror::Error;
 use tokio;
+use tokio::net::UdpSocket;
 
 #[derive(Debug, Error)]
 pub enum TrackerError {
     #[error("invalid tracker URL: {0}")]
     InvalidUrl(String),
+
+    #[error("invalid tracker action: {0}")]
+    InvalidAction(u32),
 
     #[error("network error: {0}")]
     NetworkError(String),
@@ -24,6 +28,9 @@ pub enum TrackerError {
 
     #[error("invalid tracker response format")]
     InvalidResponseFormat,
+
+    #[error("invalid tracker response size")]
+    InvalidResponseSize(usize),
 
     #[error("failed to parse bencoded data")]
     BencodeParseError,
@@ -84,7 +91,50 @@ async fn tracker_request(
             Ok(parsed_res)
         }
         "udp" => {
-            unimplemented!()
+            let socket = UdpSocket::bind("0.0.0.0:9696")
+                .await
+                .map_err(|e| TrackerError::Io(e))?;
+
+            const PROTOCOL_ID: u64 = 0x41727101980;
+            const ACTION_FIELD: u32 = 0;
+            let transaction_id: u32 = thread_rng().r#gen();
+
+            let mut conn_req = Vec::with_capacity(16);
+            conn_req.extend_from_slice(&PROTOCOL_ID.to_be_bytes());
+            conn_req.extend_from_slice(&ACTION_FIELD.to_be_bytes());
+            conn_req.extend_from_slice(&transaction_id.to_be_bytes());
+
+            let tracker_url = match url.strip_prefix("udp://") {
+                Some(url) => url,
+                None => return Err(TrackerError::InvalidUrl(url.to_string())),
+            };
+
+            socket
+                .send_to(&conn_req, tracker_url)
+                .await
+                .map_err(|e| TrackerError::Io(e))?;
+
+            let mut buffer = [0u8; 16];
+
+            let (size, addr) = socket.recv_from(&mut buffer).await.unwrap();
+
+            if size != 16 {
+                return Err(TrackerError::InvalidResponseSize(size));
+            }
+
+            let res_action = u32::from_be_bytes(buffer[0..4].try_into().unwrap());
+            let res_transaction_id = u32::from_be_bytes(buffer[4..8].try_into().unwrap());
+            let res_connection_id = u64::from_be_bytes(buffer[8..16].try_into().unwrap());
+
+            println!(
+                "Received response: action={}, transaction_id={}, connection_id={}",
+                res_action, res_transaction_id, res_connection_id
+            );
+            if res_action != 0 {
+                return Err(TrackerError::InvalidAction(res_action));
+            }
+
+            todo!()
         }
         _ => {
             unimplemented!()
@@ -94,7 +144,7 @@ async fn tracker_request(
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    let bytes = fs::read("test/ubuntu-25.10-desktop-amd64.iso.torrent")?;
+    let bytes = fs::read("test/manjaro-gnome-25.0.10-251013-linux612.iso.torrent")?;
     let (parsed, _) = Bencode::parse(bytes.as_slice()).unwrap();
 
     let info = match parsed.as_dict().and_then(|d| d.get(&b"info".to_vec())) {
