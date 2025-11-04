@@ -1,4 +1,5 @@
 mod parser;
+mod torrent;
 use parser::Bencode;
 
 use hex;
@@ -7,10 +8,13 @@ use rand::thread_rng;
 use rand::{Rng, distributions::Alphanumeric};
 use reqwest::Client;
 use sha1::{Digest, Sha1};
+use std::path::Path;
 use std::{fs, net::Ipv4Addr, str};
 use thiserror::Error;
 use tokio;
 use tokio::net::UdpSocket;
+
+use crate::torrent::TorrentMetadata;
 
 #[derive(Debug, Error)]
 pub enum TrackerError {
@@ -57,7 +61,7 @@ pub struct Peer {
 pub struct Tracker {
     pub url: String,
     pub info_hash: [u8; 20],
-    pub peer_id: String,gi
+    pub peer_id: String,
     pub port: u16,
     pub uploaded: u64,
     pub downloaded: u64,
@@ -304,7 +308,7 @@ async fn tracker_request(tracker: &Tracker) -> Result<TrackerResponse, TrackerEr
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    let bytes = fs::read("test/ubuntu-25.10-desktop-amd64.iso.torrent")?;
+    let bytes = fs::read("test/manjaro-gnome-25.0.10-251013-linux612.iso.torrent")?;
     let (parsed, _) = Bencode::parse(bytes.as_slice()).unwrap();
 
     let info = match parsed.as_dict().and_then(|d| d.get(&b"info".to_vec())) {
@@ -382,6 +386,12 @@ async fn main() -> std::io::Result<()> {
         }
     };
     println!("Response: {:?}", response);
+
+    println!("------------------------------------");
+    let metadata = TorrentMetadata::from_file(Path::new(
+        "test/manjaro-gnome-25.0.10-251013-linux612.iso.torrent",
+    ));
+    println!("Metadata: {:?}", metadata);
 
     Ok(())
 }
