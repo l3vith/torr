@@ -1,10 +1,9 @@
-use std::convert::Infallible;
 use std::fs::read;
 
 use crate::Bencode;
-use crate::Tracker;
-use crate::{Peer, TrackerError};
+use crate::{Rng, tracker::Peer, tracker::Tracker, tracker::TrackerError};
 
+use rand::{distributions::Alphanumeric, thread_rng};
 use sha1::Digest;
 use sha1::Sha1;
 use std::fmt;
@@ -43,7 +42,7 @@ pub enum TorrentError {
     UnsupportedMetadataVersion(i64),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TorrentMetadata {
     // from info dictionary
     pub info_hash: [u8; 20],
@@ -65,17 +64,19 @@ pub struct TorrentMetadata {
     pub web_seeds: Option<Vec<String>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TorrentFile {
     pub length: u64,
     pub path: String,
     pub md5sum: Option<String>,
 }
 
+#[derive(Clone, Debug)]
 pub struct Torrent {
     pub metadata: TorrentMetadata,
-    pub trackers: Vec<Tracker>,
+    pub trackers: Vec<Vec<Tracker>>,
     pub peers: Vec<Peer>,
+    pub peer_id: String,
     // Implement another struct for handling state of torrent downloads
 }
 
@@ -174,9 +175,7 @@ impl TorrentMetadata {
         let meta_version = info_dict
             .get(&b"meta version".to_vec())
             .and_then(|version| version.as_int())
-            .ok_or_else(|| {
-                TorrentError::InvalidMetadata("Invalid field 'meta version'".to_string())
-            })?;
+            .unwrap_or(1);
 
         // Exit gracefully for BitTorrent v2 file as they are unsupported
         if meta_version == 2 {
@@ -454,5 +453,67 @@ impl fmt::Display for TorrentMetadata {
 
         writeln!(f, "============================")?;
         Ok(())
+    }
+}
+
+impl Torrent {
+    pub fn new(metadata: TorrentMetadata) -> Self {
+        Torrent {
+            metadata,
+            trackers: Vec::new(),
+            peers: Vec::new(),
+            peer_id: Torrent::generate_peer_id(),
+        }
+    }
+
+    pub fn get_size(&self) -> u64 {
+        self.metadata.files.iter().map(|file| file.length).sum()
+    }
+
+    pub fn generate_peer_id() -> String {
+        let prefix = "-RS1000-"; // RS = Rust Client, 1000 = version 1.0.0
+        let random: String = thread_rng()
+            .sample_iter(&Alphanumeric)
+            .take(12)
+            .map(char::from)
+            .collect();
+
+        format!("{}{}", prefix, random)
+    }
+
+    pub fn initialize_trackers(&mut self) {
+        self.trackers = self.build_trackers();
+    }
+
+    pub fn build_trackers(&self) -> Vec<Vec<Tracker>> {
+        let mut trackers: Vec<Vec<Tracker>> = Vec::new();
+        let port = 6881;
+        let uploaded = 0;
+        let downloaded = 0;
+        let left = self.get_size();
+
+        // Single announce
+        if let Some(announce) = &self.metadata.announce {
+            trackers.push(vec![Tracker::new(
+                announce.clone(),
+                port,
+                uploaded,
+                downloaded,
+                left,
+            )]);
+        }
+
+        // Multi-tier announce-list
+        if let Some(announce_list) = &self.metadata.announce_list {
+            for tier in announce_list {
+                let tier_trackers = tier
+                    .iter()
+                    .map(|tracker| Tracker::new(tracker.clone(), port, uploaded, downloaded, left))
+                    .collect::<Vec<Tracker>>();
+                trackers.push(tier_trackers);
+            }
+        }
+
+        trackers
     }
 }
