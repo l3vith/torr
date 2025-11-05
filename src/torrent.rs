@@ -38,6 +38,9 @@ pub enum TorrentError {
 
     #[error("Unknown or unexpected error: {0}")]
     Other(String),
+
+    #[error("Unsupported metadata version: {0}")]
+    UnsupportedMetadataVersion(i64),
 }
 
 #[derive(Debug)]
@@ -167,6 +170,18 @@ impl TorrentMetadata {
             .ok_or_else(|| TorrentError::MissingField("Missing field 'info'".to_string()))?
             .as_dict()
             .ok_or_else(|| TorrentError::InvalidMetadata("Invalid field 'info'".to_string()))?;
+
+        let meta_version = info_dict
+            .get(&b"meta version".to_vec())
+            .and_then(|version| version.as_int())
+            .ok_or_else(|| {
+                TorrentError::InvalidMetadata("Invalid field 'meta version'".to_string())
+            })?;
+
+        // Exit gracefully for BitTorrent v2 file as they are unsupported
+        if meta_version == 2 {
+            return Err(TorrentError::UnsupportedMetadataVersion(meta_version));
+        }
 
         let name = info_dict
             .get(&b"name".to_vec())
