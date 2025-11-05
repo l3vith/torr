@@ -7,6 +7,7 @@ use crate::{Peer, TrackerError};
 
 use sha1::Digest;
 use sha1::Sha1;
+use std::fmt;
 use std::io;
 use std::path::Path;
 use std::string::FromUtf8Error;
@@ -50,7 +51,7 @@ pub struct TorrentMetadata {
 
     // top-level fields
     pub announce: Option<String>,
-    pub announce_list: Option<Vec<String>>,
+    pub announce_list: Option<Vec<Vec<String>>>,
     pub creation_date: Option<u64>,
     pub comment: Option<String>,
     pub created_by: Option<String>,
@@ -93,7 +94,7 @@ impl TorrentMetadata {
         pieces: Vec<[u8; 20]>,
         files: Vec<TorrentFile>,
         announce: Option<String>,
-        announce_list: Option<Vec<String>>,
+        announce_list: Option<Vec<Vec<String>>>,
         creation_date: Option<u64>,
         comment: Option<String>,
         created_by: Option<String>,
@@ -125,7 +126,7 @@ impl TorrentMetadata {
         }?;
 
         let mut buffer = Vec::new();
-        Bencode::encode(info, &mut buffer);
+        Bencode::encode(info, &mut buffer)?;
 
         let mut hasher = Sha1::new();
         hasher.update(&buffer);
@@ -274,22 +275,169 @@ impl TorrentMetadata {
             }
         }
 
+        // Getting announce url
+
+        let announce = bencoded_metadata
+            .as_dict()
+            .ok_or_else(|| TorrentError::Bencode("Bencoded Parse Error".to_string()))?
+            .get(&b"announce".to_vec())
+            .and_then(|b| b.as_string())
+            .map(|b| String::from_utf8(b.to_vec()))
+            .transpose()?;
+
+        let announce_list = bencoded_metadata
+            .as_dict()
+            .ok_or_else(|| TorrentError::Bencode("Bencoded Parse Error".to_string()))?
+            .get(&b"announce-list".to_vec())
+            .and_then(|outer| outer.as_vec())
+            .map(|outer| {
+                outer
+                    .iter()
+                    .map(|tier| {
+                        tier.as_vec()
+                            .ok_or_else(|| {
+                                TorrentError::Bencode("Invalid announce-list tier".to_string())
+                            })?
+                            .iter()
+                            .map(|tracker| {
+                                tracker
+                                    .as_string()
+                                    .ok_or_else(|| {
+                                        TorrentError::Bencode("Invalid tracker entry".to_string())
+                                    })
+                                    .and_then(|bytes| {
+                                        String::from_utf8(bytes.to_vec()).map_err(|_| {
+                                            TorrentError::Bencode(
+                                                "Invalid UTF-8 in tracker".to_string(),
+                                            )
+                                        })
+                                    })
+                            })
+                            .collect::<Result<Vec<String>, TorrentError>>()
+                    })
+                    .collect::<Result<Vec<Vec<String>>, TorrentError>>()
+            })
+            .transpose()?;
+
+        let creation_date = bencoded_metadata
+            .as_dict()
+            .and_then(|d| d.get(&b"creation date".to_vec()))
+            .and_then(|date| date.as_int())
+            .and_then(|date| u64::try_from(date).ok());
+
+        let comment = bencoded_metadata
+            .as_dict()
+            .and_then(|d| d.get(&b"comment".to_vec()))
+            .and_then(|comment| comment.as_string())
+            .and_then(|comment| String::from_utf8(comment.to_vec()).ok());
+
+        let created_by = bencoded_metadata
+            .as_dict()
+            .and_then(|d| d.get(&b"created by".to_vec()))
+            .and_then(|created| created.as_string())
+            .and_then(|created| String::from_utf8(created.to_vec()).ok());
+
+        let encoding = bencoded_metadata
+            .as_dict()
+            .and_then(|d| d.get(&b"encoding".to_vec()))
+            .and_then(|enc| enc.as_string())
+            .and_then(|enc| String::from_utf8(enc.to_vec()).ok());
+
+        let is_private: bool = info_dict
+            .get(&b"private".to_vec())
+            .and_then(|private| private.as_int())
+            .map(|private| private == 1)
+            .unwrap_or(false);
+
         let metadata: TorrentMetadata = TorrentMetadata::new(
             info_hash,
             String::from_utf8(name.to_vec())?,
             piece_length,
             pieces,
             files,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            false,
+            announce,
+            announce_list,
+            creation_date,
+            comment,
+            created_by,
+            encoding,
+            is_private,
             None,
         );
 
         Ok(metadata)
+    }
+}
+
+impl fmt::Display for TorrentMetadata {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "===== Torrent Metadata =====")?;
+        writeln!(f, "Name: {}", self.name)?;
+        writeln!(f, "Piece Length: {} bytes", self.piece_length)?;
+        writeln!(f, "Total Pieces: {}", self.pieces.len())?;
+
+        // Hash (hex)
+        let info_hash_hex: String = self
+            .info_hash
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+        writeln!(f, "Info Hash: {}", info_hash_hex)?;
+
+        writeln!(f, "\n--- Files ---")?;
+        for file in &self.files {
+            writeln!(
+                f,
+                "  {} ({} bytes{})",
+                file.path,
+                file.length,
+                if let Some(md5) = &file.md5sum {
+                    format!(", md5: {}", md5)
+                } else {
+                    "".to_string()
+                }
+            )?;
+        }
+
+        writeln!(f, "\n--- Trackers ---")?;
+        if let Some(announce) = &self.announce {
+            writeln!(f, "Primary: {}", announce)?;
+        } else {
+            writeln!(f, "Primary: <none>")?;
+        }
+
+        if let Some(list) = &self.announce_list {
+            for (tier, trackers) in list.iter().enumerate() {
+                writeln!(f, "  Tier {}:", tier + 1)?;
+                for t in trackers {
+                    writeln!(f, "    {}", t)?;
+                }
+            }
+        }
+
+        if let Some(ws) = &self.web_seeds {
+            writeln!(f, "\n--- Web Seeds ---")?;
+            for url in ws {
+                writeln!(f, "  {}", url)?;
+            }
+        }
+
+        writeln!(f, "\n--- Misc ---")?;
+        writeln!(f, "Private: {}", if self.is_private { "Yes" } else { "No" })?;
+        if let Some(date) = self.creation_date {
+            writeln!(f, "Creation Date: {}", date)?;
+        }
+        if let Some(comment) = &self.comment {
+            writeln!(f, "Comment: {}", comment)?;
+        }
+        if let Some(created_by) = &self.created_by {
+            writeln!(f, "Created By: {}", created_by)?;
+        }
+        if let Some(enc) = &self.encoding {
+            writeln!(f, "Encoding: {}", enc)?;
+        }
+
+        writeln!(f, "============================")?;
+        Ok(())
     }
 }

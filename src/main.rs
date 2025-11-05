@@ -389,9 +389,9 @@ async fn main() -> std::io::Result<()> {
 
     println!("------------------------------------");
     let metadata = TorrentMetadata::from_file(Path::new(
-        "test/manjaro-gnome-25.0.10-251013-linux612.iso.torrent",
+        "test/test_folder-d984f67af9917b214cd8b6048ab5624c7df6a07a.torrent",
     ));
-    println!("Metadata: {:?}", metadata);
+    println!("{}", metadata.unwrap());
 
     Ok(())
 }
