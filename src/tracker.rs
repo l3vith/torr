@@ -47,9 +47,6 @@ pub enum TrackerError {
 pub struct Tracker {
     pub url: String,
     pub port: u16,
-    pub uploaded: u64,
-    pub downloaded: u64,
-    pub left: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -78,13 +75,10 @@ impl TrackerResponse {
 }
 
 impl Tracker {
-    pub fn new(url: String, port: u16, uploaded: u64, downloaded: u64, left: u64) -> Tracker {
+    pub fn new(url: String, port: u16) -> Tracker {
         Tracker {
             url,
-            port,
-            uploaded,
-            downloaded,
-            left,
+            port
         }
     }
 
@@ -92,6 +86,10 @@ impl Tracker {
         &mut self,
         info_hash: &[u8; 20],
         peer_id: String,
+        uploaded: u64,
+        downloaded: u64,
+        left: u64,
+        num_want: i32
     ) -> Result<TrackerResponse, TrackerError> {
         let protocol = self
             .url
@@ -111,9 +109,9 @@ impl Tracker {
                     info_hash_encoded,
                     peer_id_encoded,
                     self.port,
-                    self.uploaded,
-                    self.downloaded,
-                    self.left,
+                    uploaded,
+                    downloaded,
+                    left,
                     num_want
                 );
                 let client = Client::new();
@@ -228,9 +226,9 @@ impl Tracker {
                 announce_packet.extend_from_slice(&ann_transaction_id.to_be_bytes());
                 announce_packet.extend_from_slice(info_hash);
                 announce_packet.extend_from_slice(&peer_id.as_bytes());
-                announce_packet.extend_from_slice(&self.downloaded.to_be_bytes());
-                announce_packet.extend_from_slice(&self.left.to_be_bytes());
-                announce_packet.extend_from_slice(&self.uploaded.to_be_bytes());
+                announce_packet.extend_from_slice(&downloaded.to_be_bytes());
+                announce_packet.extend_from_slice(&left.to_be_bytes());
+                announce_packet.extend_from_slice(&uploaded.to_be_bytes());
                 announce_packet.extend_from_slice(&event.to_be_bytes());
                 announce_packet.extend_from_slice(&ip_addr.to_be_bytes());
                 announce_packet.extend_from_slice(&key.to_be_bytes());

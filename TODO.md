@@ -12,10 +12,10 @@
 - [ ] Add support for multiple tracker types (HTTP, HTTPS, UDP)
 - [ ] Separate tracker logic into dedicated module (`tracker.rs`)
 - [ ] Write integration tests for tracker responses
-- [ ] Implement peer list decoding validation (size, alignment)
+- [ ] Implement list decoding validation (size, alignment)
 
 ## Low Priority
-- [ ] Reformat codebase and introduce idiomatic structs for peer/tracker state
+- [ ] Reformat codebase and introduce idiomatic structs for /tracker state
 - [ ] Introduce support for DHT
 - [ ] Add CLI flags for configuration (e.g. `--no-dht`, `--port`, `--trackers`)
 - [ ] Implement simple logging to file (for debugging tracker exchange)

@@ -1,7 +1,7 @@
 use std::fs::read;
 
 use crate::Bencode;
-use crate::{Rng, tracker::Peer, tracker::Tracker, tracker::TrackerError};
+use crate::{Rng, tracker::Peer, tracker::Tracker};
 
 use rand::{distributions::Alphanumeric, thread_rng};
 use sha1::Digest;
@@ -77,6 +77,10 @@ pub struct Torrent {
     pub trackers: Vec<Vec<Tracker>>,
     pub peers: Vec<Peer>,
     pub peer_id: String,
+    
+    pub downloaded_total: u64,
+    pub uploaded_total: u64,
+    pub left_total: u64,
     // Implement another struct for handling state of torrent downloads
 }
 
@@ -378,7 +382,6 @@ impl TorrentMetadata {
             is_private,
             None,
         );
-
         Ok(metadata)
     }
 }
@@ -459,10 +462,13 @@ impl fmt::Display for TorrentMetadata {
 impl Torrent {
     pub fn new(metadata: TorrentMetadata) -> Self {
         Torrent {
-            metadata,
+            metadata: metadata.clone(),
             trackers: Vec::new(),
             peers: Vec::new(),
             peer_id: Torrent::generate_peer_id(),
+            downloaded_total: 0,
+            uploaded_total: 0,
+            left_total: metadata.files.iter().map(|f| f.length).sum(),
         }
     }
 
@@ -488,18 +494,12 @@ impl Torrent {
     pub fn build_trackers(&self) -> Vec<Vec<Tracker>> {
         let mut trackers: Vec<Vec<Tracker>> = Vec::new();
         let port = 6881;
-        let uploaded = 0;
-        let downloaded = 0;
-        let left = self.get_size();
 
         // Single announce
         if let Some(announce) = &self.metadata.announce {
             trackers.push(vec![Tracker::new(
                 announce.clone(),
-                port,
-                uploaded,
-                downloaded,
-                left,
+                port
             )]);
         }
 
@@ -508,7 +508,7 @@ impl Torrent {
             for tier in announce_list {
                 let tier_trackers = tier
                     .iter()
-                    .map(|tracker| Tracker::new(tracker.clone(), port, uploaded, downloaded, left))
+                    .map(|tracker| Tracker::new(tracker.clone(), port))
                     .collect::<Vec<Tracker>>();
                 trackers.push(tier_trackers);
             }

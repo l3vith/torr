@@ -77,7 +77,7 @@ async fn main() -> std::io::Result<()> {
     let announce_string = str::from_utf8(announce_bytes)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "bencode parse error"))?;
 
-    let mut tracker = Tracker::new(announce_string.to_string(), 6881, 0, 0, 1000);
+    let mut tracker = Tracker::new(announce_string.to_string(), 6881);
 
     let metadata = TorrentMetadata::from_file(Path::new(
         "test/test_folder-d984f67af9917b214cd8b6048ab5624c7df6a07a.torrent",
@@ -88,6 +88,10 @@ async fn main() -> std::io::Result<()> {
         .tracker_request(
             &TorrentMetadata::get_info_hash(&parsed).unwrap(),
             torr.peer_id.clone(),
+            torr.uploaded_total,
+            torr.downloaded_total,
+            torr.left_total,
+            -1
         )
         .await
     {
