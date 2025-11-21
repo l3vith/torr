@@ -1,9 +1,9 @@
 use percent_encoding::{NON_ALPHANUMERIC, percent_encode};
 use rand::{Rng, distributions::Alphanumeric, thread_rng};
 use reqwest::Client;
-use std::net::Ipv4Addr;
+use std::{net::Ipv4Addr, time::Duration};
 use thiserror::Error;
-use tokio::net::UdpSocket;
+use tokio::{net::UdpSocket, time::timeout};
 
 use crate::Bencode;
 
@@ -39,6 +39,9 @@ pub enum TrackerError {
     #[error("tracker returned failure: {0}")]
     TrackerFailure(String),
 
+    #[error("Invalid Response: {0}")]
+    InvalidResponse(String),
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -49,7 +52,7 @@ pub struct Tracker {
     pub port: u16,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct Peer {
     ip: Ipv4Addr,
     port: u16,
@@ -76,20 +79,17 @@ impl TrackerResponse {
 
 impl Tracker {
     pub fn new(url: String, port: u16) -> Tracker {
-        Tracker {
-            url,
-            port
-        }
+        Tracker { url, port }
     }
 
     pub async fn tracker_request(
-        &mut self,
+        &self,
         info_hash: &[u8; 20],
         peer_id: String,
         uploaded: u64,
         downloaded: u64,
         left: u64,
-        num_want: i32
+        num_want: i32,
     ) -> Result<TrackerResponse, TrackerError> {
         let protocol = self
             .url
@@ -102,7 +102,6 @@ impl Tracker {
                 let info_hash_encoded = percent_encode(info_hash, NON_ALPHANUMERIC).to_string();
                 let peer_id_encoded =
                     percent_encode(peer_id.as_bytes(), NON_ALPHANUMERIC).to_string();
-                let num_want = -1;
                 let req = format!(
                     "{}?info_hash={}&peer_id={}&port={}&uploaded={}&downloaded={}&left={}&compact=1&event=started&numwant={}",
                     self.url,
@@ -117,6 +116,7 @@ impl Tracker {
                 let client = Client::new();
                 let response = client
                     .get(&req)
+                    .timeout(Duration::from_secs(15))
                     .send()
                     .await
                     .map_err(|e| TrackerError::NetworkError(e.to_string()))?;
@@ -191,7 +191,11 @@ impl Tracker {
 
                 let mut buffer = [0u8; 16];
 
-                let (size, _addr) = socket.recv_from(&mut buffer).await.unwrap();
+                let (size, _addr) =
+                    match timeout(Duration::from_secs(15), socket.recv_from(&mut buffer)).await {
+                        Ok(result) => result.map_err(|e| TrackerError::Io(e))?,
+                        Err(_) => return Err(TrackerError::Timeout),
+                    };
 
                 if size != 16 {
                     return Err(TrackerError::InvalidResponseSize(size));
@@ -201,10 +205,12 @@ impl Tracker {
                 let res_transaction_id = u32::from_be_bytes(buffer[4..8].try_into().unwrap());
                 let res_connection_id = u64::from_be_bytes(buffer[8..16].try_into().unwrap());
 
-                println!(
-                    "Received response: action={}, transaction_id={}, connection_id={}",
-                    res_action, res_transaction_id, res_connection_id
-                );
+                // Check if sent transaction id matches recieved transaction id
+                if res_transaction_id != transaction_id {
+                    return Err(TrackerError::InvalidResponse(
+                        "Error: Transaction ID Mismatch".to_string(),
+                    ));
+                }
 
                 // Implement retrying if failure in recieving the right action id
                 if res_action != 0 {
@@ -250,10 +256,18 @@ impl Tracker {
                 let (ann_size, _ann_addr) = socket.recv_from(&mut announce_buffer).await?;
 
                 let action = u32::from_be_bytes(announce_buffer[0..4].try_into().unwrap());
-                let transaction_id = u32::from_be_bytes(announce_buffer[4..8].try_into().unwrap());
+                let res_ann_transaction_id =
+                    u32::from_be_bytes(announce_buffer[4..8].try_into().unwrap());
                 let interval = u32::from_be_bytes(announce_buffer[8..12].try_into().unwrap());
                 let leechers = u32::from_be_bytes(announce_buffer[12..16].try_into().unwrap());
                 let seeders = u32::from_be_bytes(announce_buffer[16..20].try_into().unwrap());
+
+                // Check if sent transaction id matches recieved transaction id
+                if res_ann_transaction_id != ann_transaction_id {
+                    return Err(TrackerError::InvalidResponse(
+                        "Error: Transaction ID Mismatch".to_string(),
+                    ));
+                }
 
                 let mut peer_list: Vec<Peer> = Vec::new();
                 for chunk in announce_buffer[20..ann_size].chunks_exact(6) {
@@ -263,7 +277,7 @@ impl Tracker {
                 }
 
                 println!("Action: {}", action);
-                println!("Transaction ID: {}", transaction_id);
+                println!("Transaction ID: {}", res_ann_transaction_id);
                 println!("Interval: {}", interval);
                 println!("Leechers: {}", leechers);
                 println!("Seeders: {}", seeders);

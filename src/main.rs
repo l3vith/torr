@@ -79,10 +79,9 @@ async fn main() -> std::io::Result<()> {
 
     let mut tracker = Tracker::new(announce_string.to_string(), 6881);
 
-    let metadata = TorrentMetadata::from_file(Path::new(
-        "test/test_folder-d984f67af9917b214cd8b6048ab5624c7df6a07a.torrent",
-    ))
-    .unwrap();
+    let metadata =
+        TorrentMetadata::from_file(Path::new("test/ubuntu-25.10-desktop-amd64.iso.torrent"))
+            .unwrap();
     let mut torr = Torrent::new(metadata.clone());
     let response = match tracker
         .tracker_request(
@@ -91,7 +90,7 @@ async fn main() -> std::io::Result<()> {
             torr.uploaded_total,
             torr.downloaded_total,
             torr.left_total,
-            -1
+            -1,
         )
         .await
     {
@@ -107,8 +106,20 @@ async fn main() -> std::io::Result<()> {
 
     println!("------------------------------------");
 
-    println!("{}", metadata);
     torr.initialize_trackers();
+
+    let mut trackers: Vec<Tracker> = torr
+        .trackers
+        .iter()
+        .flat_map(|tier| tier.iter())
+        .map(|t| t.clone())
+        .collect();
+
+    for tracker in trackers.iter_mut() {
+        torr.populate_peers(&tracker).await;
+    }
+
+    torr.populate_peers(&tracker).await;
     println!("{:#?}", torr);
 
     Ok(())

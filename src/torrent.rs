@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::read;
 
 use crate::Bencode;
@@ -6,10 +7,10 @@ use crate::{Rng, tracker::Peer, tracker::Tracker};
 use rand::{distributions::Alphanumeric, thread_rng};
 use sha1::Digest;
 use sha1::Sha1;
-use std::fmt;
 use std::io;
 use std::path::Path;
 use std::string::FromUtf8Error;
+use std::{fmt, panic};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -75,9 +76,9 @@ pub struct TorrentFile {
 pub struct Torrent {
     pub metadata: TorrentMetadata,
     pub trackers: Vec<Vec<Tracker>>,
-    pub peers: Vec<Peer>,
+    pub peers: HashSet<Peer>,
     pub peer_id: String,
-    
+
     pub downloaded_total: u64,
     pub uploaded_total: u64,
     pub left_total: u64,
@@ -464,7 +465,7 @@ impl Torrent {
         Torrent {
             metadata: metadata.clone(),
             trackers: Vec::new(),
-            peers: Vec::new(),
+            peers: HashSet::new(),
             peer_id: Torrent::generate_peer_id(),
             downloaded_total: 0,
             uploaded_total: 0,
@@ -497,10 +498,7 @@ impl Torrent {
 
         // Single announce
         if let Some(announce) = &self.metadata.announce {
-            trackers.push(vec![Tracker::new(
-                announce.clone(),
-                port
-            )]);
+            trackers.push(vec![Tracker::new(announce.clone(), port)]);
         }
 
         // Multi-tier announce-list
@@ -515,5 +513,26 @@ impl Torrent {
         }
 
         trackers
+    }
+
+    pub async fn populate_peers(&mut self, tracker: &Tracker) {
+        match tracker
+            .tracker_request(
+                &self.metadata.info_hash,
+                self.peer_id.clone(),
+                self.uploaded_total,
+                self.downloaded_total,
+                self.left_total,
+                -1,
+            )
+            .await
+        {
+            Ok(response) => {
+                self.peers.extend(response.peers);
+            }
+            Err(e) => {
+                eprintln!("Tracker error: {}", e);
+            }
+        };
     }
 }
