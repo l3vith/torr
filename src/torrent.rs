@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::fs::read;
+use std::collections::HashMap;
 
 use crate::Bencode;
 use crate::{Rng, peer::Peer, tracker::Tracker};
@@ -7,6 +8,7 @@ use crate::{Rng, peer::Peer, tracker::Tracker};
 use rand::{distributions::Alphanumeric, thread_rng};
 use sha1::Digest;
 use sha1::Sha1;
+use tokio::sync::mpsc::{Receiver, Sender, channel};
 use std::fmt;
 use std::io;
 use std::path::Path;
@@ -72,17 +74,23 @@ pub struct TorrentFile {
     pub md5sum: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Torrent {
     pub metadata: TorrentMetadata,
     pub trackers: Vec<Vec<Tracker>>,
     pub peers: HashSet<Peer>,
     pub peer_id: String,
+    
+    pub bitfield: Vec<u8>,
 
     pub downloaded_total: u64,
     pub uploaded_total: u64,
     pub left_total: u64,
-    // Implement another struct for handling state of torrent downloads
+
+    // Peer Communication 
+    pub peer_comms: HashMap<Peer, Sender<u32>>,
+    pub recv_channel: Receiver<u32>,
+    pub send_channel: Sender<u32>,
 }
 
 impl TorrentFile {
@@ -462,14 +470,20 @@ impl fmt::Display for TorrentMetadata {
 
 impl Torrent {
     pub fn new(metadata: TorrentMetadata) -> Self {
+        let (main_tx, main_rx) = channel(1000);
         Torrent {
             metadata: metadata.clone(),
             trackers: Vec::new(),
             peers: HashSet::new(),
             peer_id: Torrent::generate_peer_id(),
+            bitfield: vec!(0u8; metadata.pieces.len().div_ceil(8)),
             downloaded_total: 0,
             uploaded_total: 0,
             left_total: metadata.files.iter().map(|f| f.length).sum(),
+            
+            peer_comms: HashMap::new(),
+            recv_channel: main_rx,
+            send_channel: main_tx,
         }
     }
 

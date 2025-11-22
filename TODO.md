@@ -6,6 +6,7 @@
 - [ ] Add tracker request retry with backoff and max attempts
 - [ ] Add timeouts for UDP and HTTP requests
 - [ ] Add logging (info, warn, error) instead of `println!`
+- [ ] Switch stream to a buffered reader ?????
 
 ## Medium Priority
 - [ ] Parse both tracker list and single tracker (support fallback)
