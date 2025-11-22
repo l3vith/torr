@@ -1,5 +1,6 @@
+use crate::peer::Peer;
 use percent_encoding::{NON_ALPHANUMERIC, percent_encode};
-use rand::{Rng, distributions::Alphanumeric, thread_rng};
+use rand::{Rng, thread_rng};
 use reqwest::Client;
 use std::{net::Ipv4Addr, time::Duration};
 use thiserror::Error;
@@ -50,12 +51,6 @@ pub enum TrackerError {
 pub struct Tracker {
     pub url: String,
     pub port: u16,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
-pub struct Peer {
-    ip: Ipv4Addr,
-    port: u16,
 }
 
 #[derive(Debug)]
@@ -136,19 +131,17 @@ impl Tracker {
 
                 let leechers: u32 = res_dict
                     .get(&b"leechers".to_vec())
-                    .ok_or(TrackerError::MissingField("leechers"))?
-                    .as_int()
-                    .ok_or(TrackerError::InvalidResponseFormat)?
+                    .and_then(|r| r.as_int())
+                    .unwrap_or(0)
                     .try_into()
-                    .map_err(|_| TrackerError::InvalidResponseFormat)?;
+                    .unwrap_or(0);
 
                 let seeders: u32 = res_dict
                     .get(&b"seeders".to_vec())
-                    .ok_or(TrackerError::MissingField("seeders"))?
-                    .as_int()
-                    .ok_or(TrackerError::InvalidResponseFormat)?
+                    .and_then(|r| r.as_int())
+                    .unwrap_or(0)
                     .try_into()
-                    .map_err(|_| TrackerError::InvalidResponseFormat)?;
+                    .unwrap_or(0);
 
                 let mut peers: Vec<Peer> = Vec::new();
                 let peer_string = res_dict

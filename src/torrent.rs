@@ -2,15 +2,15 @@ use std::collections::HashSet;
 use std::fs::read;
 
 use crate::Bencode;
-use crate::{Rng, tracker::Peer, tracker::Tracker};
+use crate::{Rng, peer::Peer, tracker::Tracker};
 
 use rand::{distributions::Alphanumeric, thread_rng};
 use sha1::Digest;
 use sha1::Sha1;
+use std::fmt;
 use std::io;
 use std::path::Path;
 use std::string::FromUtf8Error;
-use std::{fmt, panic};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -528,6 +528,7 @@ impl Torrent {
             .await
         {
             Ok(response) => {
+                println!("Success: {:#?}", response.peers);
                 self.peers.extend(response.peers);
             }
             Err(e) => {
