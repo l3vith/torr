@@ -4,6 +4,7 @@ use thiserror::Error;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::time::timeout;
 
@@ -35,7 +36,7 @@ pub struct PeerState {
 }
 
 pub struct PeerSession {
-    pub stream: TcpStream,
+    pub writer: OwnedWriteHalf,
     pub state: PeerState,
 
     pub peer_addr: Peer,
@@ -43,7 +44,12 @@ pub struct PeerSession {
     // Initialize a channel for communication with main thread
     // mpsc channel
     pub send_channel: Sender<u32>,
-    pub recv_channel: Receiver<u32>
+    pub recv_channel: Receiver<u32>,
+}
+
+enum InternalMessage {
+    Message { id: u8, payload: Vec<u8> },
+    NetworkError(PeerError),
 }
 
 // Handshake Function
@@ -51,7 +57,7 @@ pub async fn handshake(
     peer: &Peer,
     info_hash: &[u8; 20],
     peer_id: &[u8; 20],
-) -> Result<TcpStream, PeerError> {
+) -> Result<(OwnedReadHalf, OwnedWriteHalf), PeerError> {
     let connect_future = TcpStream::connect((peer.ip, peer.port));
     let mut stream = match timeout(Duration::from_secs(5), connect_future).await {
         Ok(Ok(x)) => x,
@@ -94,14 +100,21 @@ pub async fn handshake(
 
     println!("Handshake Successful: {}", peer.ip);
 
-    Ok(stream)
+    Ok(stream.into_split())
 }
 
 impl PeerSession {
-    pub fn new(stream: TcpStream, peer_addr: Peer, peer_id: [u8; 20], pieces_count: usize, send_channel: Sender<u32>, recv_channel: Receiver<u32>) -> Self {
+    pub fn new(
+        writer: OwnedWriteHalf,
+        peer_addr: Peer,
+        peer_id: [u8; 20],
+        pieces_count: usize,
+        send_channel: Sender<u32>,
+        recv_channel: Receiver<u32>,
+    ) -> Self {
         let bitfield_len = pieces_count.div_ceil(8);
         PeerSession {
-            stream: stream,
+            writer: writer,
             state: PeerState {
                 am_choking: true,
                 am_interested: false,
@@ -113,21 +126,21 @@ impl PeerSession {
             },
             peer_addr: peer_addr,
             peer_id: peer_id,
-            
+
             send_channel: send_channel,
-            recv_channel: recv_channel
+            recv_channel: recv_channel,
         }
     }
 
     pub async fn send_message(&mut self, id: u8, payload: Vec<u8>) -> Result<(), PeerError> {
         let len = (1 + payload.len()) as u32;
-        self.stream.write_u32(len).await.map_err(|e| {
+        self.writer.write_u32(len).await.map_err(|e| {
             PeerError::PeerWireError(format!("Failed to write length prefix: {e}").to_string())
         })?;
-        self.stream.write_u8(id).await.map_err(|e| {
+        self.writer.write_u8(id).await.map_err(|e| {
             PeerError::PeerWireError(format!("Failed to write message ID: {e}").to_string())
         })?;
-        self.stream.write_all(&payload).await.map_err(|e| {
+        self.writer.write_all(&payload).await.map_err(|e| {
             PeerError::PeerWireError(format!("Failed to write message payload: {e}").to_string())
         })?;
         Ok(())
@@ -137,54 +150,99 @@ impl PeerSession {
         self.send_message(2, vec![]).await
     }
 
-    pub async fn start_loop(&mut self) -> Result<(), PeerError> {
+    pub async fn start_loop(&mut self, mut reader: OwnedReadHalf) -> Result<(), PeerError> {
+        let (tx, mut rx) = mpsc::channel::<InternalMessage>(128);
+
+        let stream_read = tokio::spawn(async move {
+            loop {
+                let mut length_buf = [0u8; 4];
+                let read_len = reader.read_exact(&mut length_buf).await;
+                if let Err(e) = read_len {
+                    let e = PeerError::PeerWireError(format!("Failed to read length prefix: {e}"));
+                    let _ = tx.send(InternalMessage::NetworkError(e)).await;
+                    return;
+                }
+
+                let length_prefix = match length_buf.try_into() {
+                    Ok(bytes) => u32::from_be_bytes(bytes),
+                    Err(_) => {
+                        let err = PeerError::PeerWireError("Invalid Length Prefix".into());
+                        let _ = tx.send(InternalMessage::NetworkError(err)).await;
+                        return;
+                    }
+                };
+
+                if length_prefix == 0 {
+                    continue;
+                }
+
+                let mut id_buf = [0u8; 1];
+                let read_id = reader.read_exact(&mut id_buf).await;
+                if let Err(e) = read_id {
+                    let e = PeerError::PeerWireError(format!("Failed to read ID: {e}"));
+                    let _ = tx.send(InternalMessage::NetworkError(e)).await;
+                    return;
+                }
+
+                let id = match id_buf.try_into() {
+                    Ok(bytes) => u8::from_be_bytes(bytes),
+                    Err(_) => {
+                        let err = PeerError::PeerWireError("Invalid Id".into());
+                        let _ = tx.send(InternalMessage::NetworkError(err)).await;
+                        return;
+                    }
+                };
+
+                let mut payload: Vec<u8> = vec![0u8; length_prefix as usize - 1];
+                if length_prefix as usize - 1 > 0 {
+                    let read_payload = reader.read_exact(&mut payload).await;
+                    if let Err(e) = read_payload {
+                        let err = PeerError::PeerWireError(format!("Failed to read payload: {e}"));
+                        let _ = tx.send(InternalMessage::NetworkError(err)).await;
+                        return;
+                    }
+                }
+
+                if tx
+                    .send(InternalMessage::Message { id, payload })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        // Main Loop (Command & Processing)
         loop {
-            let mut length_buf = [0u8; 4];
-            self.stream.read_exact(&mut length_buf).await.map_err(|e| {
-                PeerError::PeerWireError(format!("Unexpected EOF!: {e}").to_string())
-            })?;
+            tokio::select! {
+                Some(msg_internal) = rx.recv() => {
+                    match msg_internal {
+                        InternalMessage::NetworkError(e) => {
+                            return Err(e)
+                        },
+                        InternalMessage::Message {id, payload} => {
+                            match id {
+                                0 => self.handle_choke().await?,
+                                1 => self.handle_unchoke().await?,
+                                2 => self.handle_interested().await?,
+                                3 => self.handle_not_interested().await?,
+                                4 => self.handle_have(payload).await?,
+                                5 => self.handle_bitfield(payload).await?,
+                                6 => self.handle_request(payload).await?,
+                                7 => self.handle_piece(payload).await?,
+                                8 => self.handle_cancel().await?,
+                                9 => self.handle_port().await?,
+                                20 => self.handle_extended().await?,
+                                _ => println!("Unknown Message ID: {}", id),
+                            }
+                        },
+                    }
+                },
 
-            let length_prefix = u32::from_be_bytes(
-                length_buf
-                    .try_into()
-                    .map_err(|e| PeerError::PeerWireError("Invalid Length Prefix".to_string()))?,
-            );
-
-            if length_prefix == 0 {
-                continue;
-            }
-
-            let mut id_buf = [0u8; 1];
-            self.stream.read_exact(&mut id_buf).await.map_err(|e| {
-                PeerError::PeerWireError(format!("Unexpected EOF!: {e}").to_string())
-            })?;
-
-            let id = u8::from_be_bytes(
-                id_buf
-                    .try_into()
-                    .map_err(|e| PeerError::PeerWireError("Invalid Id".to_string()))?,
-            );
-
-            let mut payload: Vec<u8> = vec![0u8; length_prefix as usize - 1];
-            if length_prefix as usize - 1 > 0 {
-                self.stream.read_exact(&mut payload).await.map_err(|e| {
-                    PeerError::PeerWireError(format!("Unexpected EOF!: {e}").to_string())
-                })?;
-            }
-
-            match id {
-                0 => self.handle_choke().await?,
-                1 => self.handle_unchoke().await?,
-                2 => self.handle_interested().await?,
-                3 => self.handle_not_interested().await?,
-                4 => self.handle_have(payload).await?,
-                5 => self.handle_bitfield(payload).await?,
-                6 => self.handle_request(payload).await?,
-                7 => self.handle_piece(payload).await?,
-                8 => self.handle_cancel().await?,
-                9 => self.handle_port().await?,
-                20 => self.handle_extended().await?,
-                _ => todo!(),
+                Some(msg_main) = self.recv_channel.recv() => {
+                    todo!("Implement message recv & run from main thread!")
+                }
             }
         }
     }
@@ -224,7 +282,7 @@ impl PeerSession {
 
         Ok(())
     }
-    
+
     fn check_if_needed(&mut self) {
         todo!();
     }
@@ -237,9 +295,8 @@ impl PeerSession {
         }
 
         self.state.bitfield = payload;
-        
+
         // Check if peer has pieces that are needed
-        
         Ok(())
     }
 
