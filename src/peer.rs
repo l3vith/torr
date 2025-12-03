@@ -1,12 +1,17 @@
+use std::mem::needs_drop;
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::sync::RwLock;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::time::timeout;
+
+use crate::torrent::Command;
 
 #[derive(Debug, Error)]
 pub enum PeerError {
@@ -43,13 +48,33 @@ pub struct PeerSession {
     pub peer_id: [u8; 20],
     // Initialize a channel for communication with main thread
     // mpsc channel
-    pub send_channel: Sender<u32>,
-    pub recv_channel: Receiver<u32>,
+    pub send_channel: Sender<MainMessage>,
+    pub recv_channel: Receiver<Command>,
+
+    pub torrent_bitfield: Arc<RwLock<Vec<u8>>>,
 }
 
 enum InternalMessage {
     Message { id: u8, payload: Vec<u8> },
     NetworkError(PeerError),
+}
+
+#[derive(Debug)]
+pub enum MainMessage {
+    BlockRecieved {
+        piece_index: u32,
+        begin_offset: u32,
+        block_data: Vec<u8>,
+    },
+    Bitfield {
+        peer: Peer,
+        bitfield: Vec<u8>,
+    },
+    UpdateBitfield {
+        peer: Peer,
+        byte_idx: u32,
+        byte_offset: u32,
+    }
 }
 
 // Handshake Function
@@ -109,8 +134,9 @@ impl PeerSession {
         peer_addr: Peer,
         peer_id: [u8; 20],
         pieces_count: usize,
-        send_channel: Sender<u32>,
-        recv_channel: Receiver<u32>,
+        send_channel: Sender<MainMessage>,
+        recv_channel: Receiver<Command>,
+        torrent_bitfield: Arc<RwLock<Vec<u8>>>,
     ) -> Self {
         let bitfield_len = pieces_count.div_ceil(8);
         PeerSession {
@@ -129,6 +155,8 @@ impl PeerSession {
 
             send_channel: send_channel,
             recv_channel: recv_channel,
+
+            torrent_bitfield: torrent_bitfield,
         }
     }
 
@@ -147,6 +175,12 @@ impl PeerSession {
     }
 
     pub async fn send_interested(&mut self) -> Result<(), PeerError> {
+        if self.state.am_interested {
+            // Don't spam
+            return Ok(());
+        }
+
+        self.state.am_interested = true;
         self.send_message(2, vec![]).await
     }
 
@@ -241,10 +275,29 @@ impl PeerSession {
                 },
 
                 Some(msg_main) = self.recv_channel.recv() => {
-                    todo!("Implement message recv & run from main thread!")
+                    match msg_main {
+                        Command::RequestPiece { piece_index, begin_offset, block_length } => {
+                            println!("Received request for piece {}, offset {}, length {}", piece_index, begin_offset, block_length);
+                            self.request_piece(piece_index, begin_offset, block_length).await?;
+                        }
+                    }
                 }
             }
         }
+    }
+
+    async fn request_piece(
+        &mut self,
+        piece_index: u32,
+        begin_offset: u32,
+        block_length: u32,
+    ) -> Result<(), PeerError> {
+        let mut payload: Vec<u8> = Vec::new();
+        payload.extend_from_slice(&piece_index.to_be_bytes());
+        payload.extend_from_slice(&begin_offset.to_be_bytes());
+        payload.extend_from_slice(&block_length.to_be_bytes());
+        self.send_message(6, payload).await?;
+        Ok(())
     }
 
     async fn handle_choke(&mut self) -> Result<(), PeerError> {
@@ -254,6 +307,7 @@ impl PeerSession {
 
     async fn handle_unchoke(&mut self) -> Result<(), PeerError> {
         self.state.peer_choking = false;
+        println!("Peer {} has UNCHOKED us", self.peer_addr.ip);
         Ok(())
     }
 
@@ -280,11 +334,35 @@ impl PeerSession {
 
         self.state.bitfield[byte_index as usize] |= 1 << (7 - byte_offset);
 
+        if self.check_if_needed().await {
+            println!(
+                "Reacting to HAVE: Sending interested to peer: {} : {}",
+                self.peer_addr.ip, self.peer_addr.port
+            );
+            self.send_interested().await?;
+        }
+
         Ok(())
     }
 
-    fn check_if_needed(&mut self) {
-        todo!();
+    async fn check_if_needed(&mut self) -> bool {
+        let bf_self = &self.state.bitfield;
+        let bf_torrent = self.torrent_bitfield.read().await;
+
+        if bf_torrent.len() != bf_self.len() {
+            panic!("Bitfield length mismatch!");
+        } else {
+            for (a, b) in bf_self.iter().zip(bf_torrent.iter()) {
+                let inverted = !b;
+                let needed = a & inverted;
+
+                if needed != 0 {
+                    return true;
+                }
+            }
+        }
+
+        return false;
     }
 
     async fn handle_bitfield(&mut self, payload: Vec<u8>) -> Result<(), PeerError> {
@@ -296,7 +374,24 @@ impl PeerSession {
 
         self.state.bitfield = payload;
 
+        self.send_channel
+            .send(MainMessage::Bitfield {
+                peer: self.peer_addr.clone(),
+                bitfield: self.state.bitfield.clone(),
+            })
+            .await
+            .map_err(|e| PeerError::PeerWireError("Failed to send bitfield to main".to_string()))?;
+
         // Check if peer has pieces that are needed
+
+        if self.check_if_needed().await {
+            println!(
+                "Sending interested to peer: {} : {}",
+                self.peer_addr.ip, self.peer_addr.port
+            );
+            self.send_interested().await?;
+        }
+
         Ok(())
     }
 
@@ -318,7 +413,30 @@ impl PeerSession {
     }
 
     async fn handle_piece(&mut self, payload: Vec<u8>) -> Result<(), PeerError> {
-        todo!()
+        let piece_index: u32 = u32::from_be_bytes(
+            payload[..4]
+                .try_into()
+                .map_err(|e| PeerError::PeerWireError("Invalid payload".to_string()))?,
+        );
+
+        let begin_offset: u32 = u32::from_be_bytes(
+            payload[4..8]
+                .try_into()
+                .map_err(|e| PeerError::PeerWireError("Invalid payload".to_string()))?,
+        );
+
+        let block_data: Vec<u8> = payload[8..].to_vec();
+        println!("Received piece {}", piece_index);
+        self.send_channel
+            .send(MainMessage::BlockRecieved {
+                piece_index,
+                begin_offset,
+                block_data,
+            })
+            .await
+            .map_err(|e| PeerError::PeerWireError("Failed to send message".to_string()))?;
+
+        Ok(())
     }
 
     async fn handle_cancel(&mut self) -> Result<(), PeerError> {

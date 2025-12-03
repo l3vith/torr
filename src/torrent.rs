@@ -1,19 +1,24 @@
-use std::collections::HashSet;
-use std::fs::read;
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::collections::VecDeque;
+use std::fs::read;
+use std::sync::Arc;
 
 use crate::Bencode;
+use crate::peer::MainMessage;
+use crate::piece::PieceManager;
 use crate::{Rng, peer::Peer, tracker::Tracker};
 
 use rand::{distributions::Alphanumeric, thread_rng};
 use sha1::Digest;
 use sha1::Sha1;
-use tokio::sync::mpsc::{Receiver, Sender, channel};
 use std::fmt;
 use std::io;
 use std::path::Path;
 use std::string::FromUtf8Error;
 use thiserror::Error;
+use tokio::sync::RwLock;
+use tokio::sync::mpsc::{Receiver, Sender, channel};
 
 #[derive(Debug, Error)]
 pub enum TorrentError {
@@ -75,22 +80,46 @@ pub struct TorrentFile {
 }
 
 #[derive(Debug)]
+pub enum Command {
+    RequestPiece {
+        piece_index: u32,
+        begin_offset: u32,
+        block_length: u32,
+    },
+}
+
+#[derive(Debug)]
 pub struct Torrent {
+    // Torrent Information
     pub metadata: TorrentMetadata,
     pub trackers: Vec<Vec<Tracker>>,
     pub peers: HashSet<Peer>,
     pub peer_id: String,
-    
-    pub bitfield: Vec<u8>,
 
+    // Torrent Bitfield
+    pub bitfield: Arc<RwLock<Vec<u8>>>,
+
+    // Torrent Statistics
     pub downloaded_total: u64,
     pub uploaded_total: u64,
     pub left_total: u64,
 
-    // Peer Communication 
-    pub peer_comms: HashMap<Peer, Sender<u32>>,
-    pub recv_channel: Receiver<u32>,
-    pub send_channel: Sender<u32>,
+    // Peer Bitfields
+    pub peer_bitfields: HashMap<Peer, Vec<u8>>,
+
+    // Piece Manager
+    pub manager: PieceManager,
+
+    // Queue
+    pub queue: VecDeque<u32>,
+
+    // In-Flight
+    pub inflight: HashMap<u32, Peer>,
+
+    // Peer Communication
+    pub peer_comms: HashMap<Peer, Sender<Command>>,
+    pub recv_channel: Receiver<MainMessage>, // Recieve from peer
+    pub send_channel: Sender<MainMessage>,   // Send to torrent
 }
 
 impl TorrentFile {
@@ -476,10 +505,20 @@ impl Torrent {
             trackers: Vec::new(),
             peers: HashSet::new(),
             peer_id: Torrent::generate_peer_id(),
-            bitfield: vec!(0u8; metadata.pieces.len().div_ceil(8)),
+            bitfield: Arc::new(RwLock::new(vec![0u8; metadata.pieces.len().div_ceil(8)])),
             downloaded_total: 0,
             uploaded_total: 0,
             left_total: metadata.files.iter().map(|f| f.length).sum(),
+
+            peer_bitfields: HashMap::new(),
+            manager: PieceManager::new(
+                metadata.pieces.len() as u32,
+                metadata.piece_length as u32,
+                metadata.files.iter().map(|f| f.length).sum(),
+                metadata.pieces,
+            ),
+            queue: VecDeque::new(),
+            inflight: HashMap::new(),
             
             peer_comms: HashMap::new(),
             recv_channel: main_rx,
@@ -487,7 +526,7 @@ impl Torrent {
         }
     }
 
-    pub fn get_size(&self) -> u64 {
+    pub fn _get_size(&self) -> u64 {
         self.metadata.files.iter().map(|file| file.length).sum()
     }
 
